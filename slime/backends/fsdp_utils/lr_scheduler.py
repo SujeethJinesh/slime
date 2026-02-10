@@ -167,7 +167,9 @@ def get_lr_scheduler(args, optimizer: torch.optim.Optimizer) -> FSDPLRScheduler:
     Returns:
         FSDPLRScheduler: Initialized scheduler bound to ``optimizer``.
     """
-    args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    args.train_iters = max(
+        1, args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
+    )  # min 1 so LR scheduler init succeeds in eval-only mode (num_rollout=0)
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters
     lr_decay_steps = args.lr_decay_iters

@@ -142,7 +142,7 @@ class RolloutManager:
     def eval(self, rollout_id):
         if self.args.debug_train_only:
             # if debug train only, we don't generate evaluation data
-            return
+            return None
         self.health_monitoring_resume()
 
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
@@ -151,6 +151,7 @@ class RolloutManager:
         metrics = _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
+        return metrics
 
     def save(self, rollout_id):
         self.data_source.save(rollout_id)
@@ -676,12 +677,14 @@ def _start_router(args):
 
 
 def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
+    if extra_metrics is None:
+        extra_metrics = {}
     if args.custom_eval_rollout_log_function_path is not None:
         custom_log_func = load_function(args.custom_eval_rollout_log_function_path)
         if custom_log_func(rollout_id, args, data, extra_metrics):
             return
 
-    log_dict = extra_metrics or {}
+    log_dict = extra_metrics
     for key in data.keys():
         rewards = data[key]["rewards"]
         log_dict[f"eval/{key}"] = sum(rewards) / len(rewards)

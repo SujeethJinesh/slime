@@ -1,3 +1,5 @@
+import logging
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
@@ -5,6 +7,39 @@ from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils import logging_utils
 from slime.utils.misc import should_run_periodic_action
+
+_logger = logging.getLogger(__name__)
+
+
+def _log_eval_metrics(args, metrics):
+    """Log eval metrics from the primary process and materialize eval table rows."""
+    if not isinstance(metrics, dict):
+        return
+    if "eval/step" not in metrics:
+        return
+
+    payload = dict(metrics)
+    table_rows = payload.pop("_eval_table_rows", None)
+    logging_utils.log(args, payload, step_key="eval/step")
+
+    if not (args.use_wandb and isinstance(table_rows, list) and table_rows):
+        return
+    if not isinstance(table_rows[0], dict):
+        return
+
+    try:
+        import wandb
+
+        if wandb.run is None:
+            return
+        columns = list(table_rows[0].keys())
+        table = wandb.Table(
+            columns=columns,
+            data=[[row.get(col) for col in columns] for row in table_rows],
+        )
+        wandb.log({"eval/sample_results": table, "eval/step": payload["eval/step"]})
+    except Exception:
+        _logger.debug("wandb.Table logging for eval/sample_results skipped", exc_info=True)
 
 
 def train(args):
@@ -35,8 +70,7 @@ def train(args):
     # special case for eval-only
     if args.num_rollout == 0 and args.eval_interval is not None:
         eval_metrics = ray.get(rollout_manager.eval.remote(rollout_id=0))
-        if isinstance(eval_metrics, dict) and "eval/step" in eval_metrics:
-            logging_utils.log(args, eval_metrics, step_key="eval/step")
+        _log_eval_metrics(args, eval_metrics)
 
     def offload_train():
         if args.offload_train:
@@ -68,8 +102,7 @@ def train(args):
     for rollout_id in range(args.start_rollout_id, args.num_rollout):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
             eval_metrics = ray.get(rollout_manager.eval.remote(rollout_id))
-            if isinstance(eval_metrics, dict) and "eval/step" in eval_metrics:
-                logging_utils.log(args, eval_metrics, step_key="eval/step")
+            _log_eval_metrics(args, eval_metrics)
 
         rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
 
@@ -96,8 +129,7 @@ def train(args):
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             eval_metrics = ray.get(rollout_manager.eval.remote(rollout_id))
-            if isinstance(eval_metrics, dict) and "eval/step" in eval_metrics:
-                logging_utils.log(args, eval_metrics, step_key="eval/step")
+            _log_eval_metrics(args, eval_metrics)
 
     ray.get(rollout_manager.dispose.remote())
 

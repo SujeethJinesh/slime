@@ -20,6 +20,7 @@ from slime.utils.async_utils import run
 from slime.utils.data import Dataset
 from slime.utils.eval_config import EvalDatasetConfig
 from slime.utils.http_utils import get, post
+from slime.utils import logging_utils
 from slime.utils.misc import SingletonMeta, load_function
 from slime.utils.processing_utils import (
     build_processor_kwargs,
@@ -441,6 +442,60 @@ async def generate_rollout_async(
 EVAL_PROMPT_DATASET = {}
 
 
+def _sample_eval_reward_fields(sample: Sample) -> tuple[float, float, float]:
+    """Extract (score, compile_pass, sim_pass) for incremental eval progress logs."""
+    reward = getattr(sample, "reward", None)
+    if isinstance(reward, dict):
+        score = float(reward.get("score", 0.0))
+        compile_pass = 1.0 if float(reward.get("compile_score", 0.0)) > 0.0 else 0.0
+        sim_pass = 1.0 if float(reward.get("sim_score", 0.0)) > 0.0 else 0.0
+        return score, compile_pass, sim_pass
+    if reward is not None:
+        score = float(reward)
+        compile_pass = 1.0 if score > -1.0 else 0.0
+        sim_pass = 1.0 if score > 0.0 else 0.0
+        return score, compile_pass, sim_pass
+    return 0.0, 0.0, 0.0
+
+
+def _log_eval_progress(
+    args: Namespace,
+    rollout_id: int,
+    dataset_name: str,
+    completed: int,
+    total: int,
+    score_sum: float,
+    compile_passes: int,
+    sim_passes: int,
+    truncated_count: int,
+) -> None:
+    """Emit streaming eval progress metrics to W&B while eval is running."""
+    if not getattr(args, "use_wandb", False) or completed <= 0 or total <= 0:
+        return
+
+    progress_metrics = {
+        "eval_progress/step": float(rollout_id) + (completed / total),
+        f"hw/eval_stream/{dataset_name}/completed": float(completed),
+        f"hw/eval_stream/{dataset_name}/total": float(total),
+        f"hw/eval_stream/{dataset_name}/completion_rate": completed / total,
+        f"hw/eval_stream/{dataset_name}/score_mean": score_sum / completed,
+        f"hw/eval_stream/{dataset_name}/compile_rate": compile_passes / completed,
+        f"hw/eval_stream/{dataset_name}/sim_pass_rate": sim_passes / completed,
+        f"hw/eval_stream/{dataset_name}/truncated_rate": truncated_count / completed,
+    }
+    logging_utils.log(args, progress_metrics, step_key="eval_progress/step")
+    logger.info(
+        "eval progress %s: %d/%d (score_mean=%.4f, compile_rate=%.4f, sim_pass_rate=%.4f, truncated_rate=%.4f)",
+        dataset_name,
+        completed,
+        total,
+        score_sum / completed,
+        compile_passes / completed,
+        sim_passes / completed,
+        truncated_count / completed,
+    )
+
+
 async def eval_rollout(args: Namespace, rollout_id: int) -> tuple[dict[str, dict[str, list[Any]]], list[list[Sample]]]:
     assert not args.group_rm, "Group RM is not supported for eval rollout"
 
@@ -526,8 +581,15 @@ async def eval_rollout_single_dataset(
             )
 
     data = []
+    total = len(tasks)
+    completed = 0
+    score_sum = 0.0
+    compile_passes = 0
+    sim_passes = 0
+    truncated_count = 0
+    progress_log_interval = max(1, total // 20) if total > 0 else 1
     do_print = True
-    pbar = tqdm(total=len(tasks), desc=f"Eval {dataset_cfg.name}", disable=not do_print)
+    pbar = tqdm(total=total, desc=f"Eval {dataset_cfg.name}", disable=not do_print)
     for coro in asyncio.as_completed(tasks):
         sample = await coro
         if do_print:
@@ -538,10 +600,31 @@ async def eval_rollout_single_dataset(
             )
             do_print = False
         if isinstance(sample, list):
-            data.extend(sample)
+            completed_samples = sample
+            data.extend(completed_samples)
         else:
+            completed_samples = [sample]
             data.append(sample)
-        pbar.update(1)
+        for completed_sample in completed_samples:
+            completed += 1
+            score, compile_pass, sim_pass = _sample_eval_reward_fields(completed_sample)
+            score_sum += score
+            compile_passes += int(compile_pass)
+            sim_passes += int(sim_pass)
+            truncated_count += int(completed_sample.status == Sample.Status.TRUNCATED)
+            if completed % progress_log_interval == 0 or completed == total:
+                _log_eval_progress(
+                    args=args,
+                    rollout_id=rollout_id,
+                    dataset_name=dataset_cfg.name,
+                    completed=completed,
+                    total=total,
+                    score_sum=score_sum,
+                    compile_passes=compile_passes,
+                    sim_passes=sim_passes,
+                    truncated_count=truncated_count,
+                )
+        pbar.update(len(completed_samples))
     pbar.close()
 
     data.sort(key=lambda sample: sample.index)

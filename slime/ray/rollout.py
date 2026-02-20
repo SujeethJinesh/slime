@@ -148,9 +148,10 @@ class RolloutManager:
         result = call_rollout_fn(self.eval_generate_rollout, self.args, rollout_id, self.data_source, evaluation=True)
         data = result.data
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=True)
-        metrics = _log_eval_rollout_data(rollout_id, self.args, data, result.metrics)
+        metrics = _log_eval_rollout_data(rollout_id, self.args, data, result.metrics or {})
         if self._metric_checker is not None:
             self._metric_checker.on_eval(metrics)
+        return metrics
 
     def save(self, rollout_id):
         self.data_source.save(rollout_id)

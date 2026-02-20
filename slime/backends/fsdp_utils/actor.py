@@ -341,12 +341,13 @@ class FSDPTrainRayActor(TrainRayActor):
                     tqdm(packed_batches, desc=f"{store_prefix}log_probs", disable=dist.get_rank() != 0)
                 ):
                     model_args = self._get_model_inputs_args(batch)
-                    logits = active_model(**model_args).logits.squeeze(0).float()
+                    logits = active_model(**model_args).logits.squeeze(0)
                     log_probs_result, entropy_result = get_logprob_and_entropy(
                         logits=logits,
                         target_tokens=batch["tokens"],
                         allow_compile=not self.args.true_on_policy_mode,
                         temperature=self.args.rollout_temperature,
+                        compute_entropy=False,
                     )
                     batch[f"{store_prefix}log_probs"] = log_probs_result
                     if store_prefix == "":
@@ -551,7 +552,7 @@ class FSDPTrainRayActor(TrainRayActor):
     def _train_step(self, packed_batch, reported_accum, mbs_id, grad_accum):
         # Prepare model inputs
         model_args = self._get_model_inputs_args(packed_batch)
-        logits = self.model(**model_args).logits.squeeze(0).float()
+        logits = self.model(**model_args).logits.squeeze(0)
 
         # Compute log probs and entropy
         log_probs, entropy_result = get_logprob_and_entropy(
@@ -559,6 +560,7 @@ class FSDPTrainRayActor(TrainRayActor):
             target_tokens=packed_batch["tokens"],
             allow_compile=not self.args.true_on_policy_mode,
             temperature=self.args.rollout_temperature,
+            compute_entropy=self.args.entropy_coef != 0.0,
         )
         packed_batch["cur_log_probs"] = log_probs
         packed_batch["entropy"] = entropy_result
@@ -808,20 +810,9 @@ class FSDPTrainRayActor(TrainRayActor):
 
 
 def selective_log_softmax_raw(logits: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
-    """Fused version of the common `log_softmax -> gather` operation.
-
-    The fused version of this operation avoids the (potentially large) memory overhead
-    of allocating a new tensor to store the full logprobs.
-
-    Parameters:
-        logits: Tensor of shape [..., V] containing model logits.
-        input_ids: Tensor of shape [...] of token indices whose log-probabilities are gathered.
-
-    Returns:
-        Tensor of shape [...] containing the log-probabilities corresponding to `input_ids`.
-    """
-    logprobs = logits.log_softmax(dim=-1)
-    return torch.gather(logprobs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+    """Compute gathered log-probs without materializing full log_softmax tensor."""
+    target_logits = torch.gather(logits, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+    return target_logits - torch.logsumexp(logits, dim=-1)
 
 
 selective_log_softmax_compiled = torch.compile(dynamic=True)(selective_log_softmax_raw)
@@ -866,6 +857,7 @@ def get_logprob_and_entropy(
     target_tokens: torch.Tensor,
     allow_compile: bool,
     temperature: float | None = None,
+    compute_entropy: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute log probabilities and entropy.
 
@@ -874,6 +866,7 @@ def get_logprob_and_entropy(
         target_tokens: Target tokens with shape [seq_len]
         allow_compile: Whether to allow compilation
         temperature: Temperature parameter (optional)
+        compute_entropy: Whether to compute per-token entropy.
 
     Returns:
         log_probs: Log probabilities with shape [seq_len - 1]
@@ -883,6 +876,8 @@ def get_logprob_and_entropy(
     log_probs = gather_log_probs_packed(
         shifted_logits, target_tokens, allow_compile=allow_compile, temperature=temperature
     )
+    if not compute_entropy:
+        return log_probs, torch.zeros_like(log_probs)
     log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
     probs = torch.softmax(shifted_logits, dim=-1)
     entropy = -(probs * log_probs_full).sum(dim=-1)

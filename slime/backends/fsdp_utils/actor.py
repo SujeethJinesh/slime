@@ -477,8 +477,23 @@ class FSDPTrainRayActor(TrainRayActor):
                 unpacked_batches = unpack_sequences(batches)
                 for unpacked_batch in unpacked_batches:
                     if isinstance(unpacked_batch[metric_key], torch.Tensor):
-                        loss_masks_tensor = unpacked_batch["loss_masks"].to(device=torch.cuda.current_device())
-                        metric_tensor = unpacked_batch[metric_key].to(device=torch.cuda.current_device())
+                        loss_masks_tensor = unpacked_batch["loss_masks"].to(device=torch.cuda.current_device()).view(-1)
+                        metric_tensor = unpacked_batch[metric_key].to(device=torch.cuda.current_device()).view(-1)
+                        if metric_tensor.numel() != loss_masks_tensor.numel():
+                            min_len = min(metric_tensor.numel(), loss_masks_tensor.numel())
+                            if min_len == 0:
+                                continue
+                            if dist.get_rank() == 0:
+                                logger.warning(
+                                    "rollout metric length mismatch for %s (metric=%s, mask=%s); "
+                                    "using min_len=%s for logging.",
+                                    metric_key,
+                                    metric_tensor.numel(),
+                                    loss_masks_tensor.numel(),
+                                    min_len,
+                                )
+                            metric_tensor = metric_tensor[:min_len]
+                            loss_masks_tensor = loss_masks_tensor[:min_len]
                         val += (metric_tensor * loss_masks_tensor).sum() / loss_masks_tensor.sum().clamp_min(1)
                     else:
                         val += unpacked_batch[metric_key]
@@ -633,10 +648,37 @@ class FSDPTrainRayActor(TrainRayActor):
         # Only compare rollout vs. train log probs when they originate from different stages.
         train_rollout_logprob_abs_diff = None
         if not self.args.use_rollout_logprobs and rollout_log_probs is not None:
-            train_rollout_logprob_abs_diff = (old_log_probs - rollout_log_probs).abs()
-            train_rollout_logprob_abs_diff = sum_of_sample_mean(
-                train_rollout_logprob_abs_diff, response_lengths, loss_masks
-            ).detach()
+            per_sample_rollout_diff = []
+            for batch_idx, batch in enumerate(unpacked_batches):
+                old_tensor = batch.get("log_probs")
+                rollout_tensor = batch.get("rollout_log_probs")
+                if not isinstance(old_tensor, torch.Tensor) or not isinstance(rollout_tensor, torch.Tensor):
+                    continue
+
+                old_vec = old_tensor.to(device=log_probs.device).view(-1)
+                rollout_vec = rollout_tensor.to(device=log_probs.device).view(-1)
+                mask_vec = batch["loss_masks"].to(device=log_probs.device).view(-1)
+
+                min_len = min(old_vec.numel(), rollout_vec.numel(), mask_vec.numel())
+                if min_len == 0:
+                    continue
+                if (old_vec.numel() != rollout_vec.numel() or old_vec.numel() != mask_vec.numel()) and dist.get_rank() == 0:
+                    logger.warning(
+                        "train rollout logprob length mismatch in batch %s (old=%s, rollout=%s, mask=%s); "
+                        "using min_len=%s for logging metric.",
+                        batch_idx,
+                        old_vec.numel(),
+                        rollout_vec.numel(),
+                        mask_vec.numel(),
+                        min_len,
+                    )
+
+                diff_vec = (old_vec[:min_len] - rollout_vec[:min_len]).abs()
+                mask_slice = mask_vec[:min_len]
+                per_sample_rollout_diff.append((diff_vec * mask_slice).sum() / mask_slice.sum().clamp_min(1))
+
+            if per_sample_rollout_diff:
+                train_rollout_logprob_abs_diff = sum(per_sample_rollout_diff).detach()
 
         entropy = torch.cat([batch["entropy"] for batch in unpacked_batches], dim=0)
         entropy_loss = sum_of_sample_mean(entropy, response_lengths, loss_masks)

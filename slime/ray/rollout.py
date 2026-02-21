@@ -703,11 +703,29 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
                 f"eval/{key}-",
             )
 
-    logger.info(f"eval {rollout_id}: {log_dict}")
+    # Keep console logs bounded: summarize non-scalar payloads (notably
+    # `_eval_table_rows`) instead of printing full row blobs.
+    log_preview = {}
+    for key, value in log_dict.items():
+        if isinstance(value, (int, float, bool)):
+            log_preview[key] = value
+        elif key == "_eval_table_rows" and isinstance(value, list):
+            log_preview[key] = f"<{len(value)} rows>"
+        else:
+            log_preview[key] = f"<{type(value).__name__}>"
+    logger.info(f"eval {rollout_id}: {log_preview}")
 
     step = compute_rollout_step(args, rollout_id)
     log_dict["eval/step"] = step
-    logging_utils.log(args, log_dict, step_key="eval/step")
+    # Secondary-process logging should stay scalar-only. The primary process
+    # consumes the full payload (including `_eval_table_rows`) and emits the
+    # eval table via `train._log_eval_metrics`.
+    scalar_log_dict = {
+        k: v
+        for k, v in log_dict.items()
+        if isinstance(v, (int, float, bool))
+    }
+    logging_utils.log(args, scalar_log_dict, step_key="eval/step")
 
     return log_dict
 

@@ -2,6 +2,7 @@ import asyncio
 import copy
 import inspect
 import logging
+import os
 import uuid
 from argparse import Namespace
 from collections.abc import Callable
@@ -35,6 +36,19 @@ from .rm_hub import async_rm, batched_async_rm
 __all__ = ["generate_rollout"]
 
 logger = logging.getLogger(__name__)
+_SAMPLE_LOG_MAX_CHARS = max(256, int(os.getenv("SLIME_SAMPLE_LOG_MAX_CHARS", "1200")))
+
+
+def _summarize_sample_for_log(sample: Sample) -> str:
+    """Return a bounded prompt+response summary for rollout debug logs."""
+    prompt = str(getattr(sample, "prompt", "") or "")
+    response = str(getattr(sample, "response", "") or "")
+    combined = prompt + response
+    if len(combined) <= _SAMPLE_LOG_MAX_CHARS:
+        return combined
+    head = _SAMPLE_LOG_MAX_CHARS // 2
+    tail = _SAMPLE_LOG_MAX_CHARS - head
+    return combined[:head] + "\n...(truncated)...\n" + combined[-tail:]
 
 
 class GenerateState(metaclass=SingletonMeta):
@@ -392,7 +406,10 @@ async def generate_rollout_async(
             if do_print:
                 sample = group[0][0] if isinstance(group[0], list) else group[0]
                 logger.info(
-                    f"First rollout sample: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+                    "First rollout sample: %s, label: %s, reward: %s",
+                    _summarize_sample_for_log(sample),
+                    str(sample.label)[:100],
+                    sample.reward,
                 )
                 do_print = False
 
@@ -413,7 +430,10 @@ async def generate_rollout_async(
     pbar.close()
     sample = data[-1][0][0] if isinstance(data[-1][0], list) else data[-1][0]
     logger.info(
-        f"Finish rollout: {[str(sample.prompt) + sample.response]}, label: {str(sample.label)[:100]}, reward: {sample.reward}",
+        "Finish rollout: %s, label: %s, reward: %s",
+        _summarize_sample_for_log(sample),
+        str(sample.label)[:100],
+        sample.reward,
     )
 
     # there are still some unfinished requests, abort them

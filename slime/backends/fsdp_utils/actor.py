@@ -127,6 +127,14 @@ class FSDPTrainRayActor(TrainRayActor):
 
         self.global_step = 0
         self.micro_step = 0
+        self._effective_update_count = 0
+        self._zero_grad_step_count = 0
+        try:
+            self._zero_grad_eps = float(os.getenv("HW_AGENT_ZERO_GRAD_EPS", "1e-12"))
+        except (TypeError, ValueError):
+            self._zero_grad_eps = 1e-12
+        if self._zero_grad_eps < 0:
+            self._zero_grad_eps = 0.0
 
         checkpoint_payload = checkpoint.load(self)
 
@@ -730,6 +738,17 @@ class FSDPTrainRayActor(TrainRayActor):
             grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.clip_grad)
             # the grad norm used to be of DTensor
             grad_norm = float(grad_norm)
+            effective_update = 1.0 if abs(grad_norm) > self._zero_grad_eps else 0.0
+            zero_grad_step = 1.0 - effective_update
+            self._effective_update_count += int(effective_update)
+            self._zero_grad_step_count += int(zero_grad_step)
+            total_steps = self._effective_update_count + self._zero_grad_step_count
+            effective_update_rate = (
+                self._effective_update_count / total_steps if total_steps > 0 else 0.0
+            )
+            zero_grad_step_rate = (
+                self._zero_grad_step_count / total_steps if total_steps > 0 else 0.0
+            )
 
             self.optimizer.step()
             # Update learning rate
@@ -749,6 +768,10 @@ class FSDPTrainRayActor(TrainRayActor):
                     f"train/{k}": (val.item() if torch.is_tensor(val) else val) for k, val in aggregated.items()
                 }
                 log_dict["train/grad_norm"] = grad_norm
+                log_dict["train/effective_update"] = effective_update
+                log_dict["train/zero_grad_step"] = zero_grad_step
+                log_dict["train/effective_update_rate"] = effective_update_rate
+                log_dict["train/zero_grad_step_rate"] = zero_grad_step_rate
 
                 # Log learning rate per parameter group; use scheduler's last computed LRs
                 lr_values = self.lr_scheduler.get_last_lr()
